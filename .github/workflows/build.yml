@@ -1,0 +1,70 @@
+name: Build desktop packages
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: windows-x64, runner: windows-2022, python: '3.12', arch: x64}
+          - {target: windows-legacy-x86, runner: windows-2022, python: '3.8.10', arch: x86}
+          - {target: linux-x64, runner: ubuntu-22.04, python: '3.12', arch: x64}
+          - {target: macos-arm64, runner: macos-15, python: '3.12', arch: arm64}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+          architecture: ${{ matrix.arch }}
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0 libxcb-xinerama0 libxcb-cursor0
+      - name: Install legacy build dependencies
+        if: matrix.target == 'windows-legacy-x86'
+        run: >-
+          python -m pip install --only-binary=:all: setuptools==59.8.0 PyInstaller==4.10 pyinstaller-hooks-contrib==2022.3 pefile==2023.2.7 pywin32-ctypes==0.2.2 altgraph==0.17.4 PyQt5==5.15.2 PyQt5-sip==12.8.1 lz4==4.3.2 zstandard==0.22.0
+      - name: Install modern build dependencies
+        if: matrix.target != 'windows-legacy-x86'
+        run: >-
+          python -m pip install --only-binary=:all: PyInstaller==6.22.0 PyQt5==5.15.11 lz4==4.4.4 zstandard==0.25.0
+      - name: Build and smoke-test package
+        run: python scripts/build.py ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: packages/*
+          if-no-files-found: error
+          retention-days: 14
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: packages
+          merge-multiple: true
+      - name: Publish verified packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cat packages/*.sha256 > packages/SHA256SUMS.txt
+          (cd packages && sha256sum -c SHA256SUMS.txt)
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" packages/*.zip packages/*.tar.gz packages/SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" packages/*.zip packages/*.tar.gz packages/SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+          fi
