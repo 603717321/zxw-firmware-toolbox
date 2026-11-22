@@ -1976,6 +1976,14 @@ class PartitionWorkspacePage(QWidget):
             self.win.load_partition_directory(path)
 
 
+class FileListTable(AutoFitTable):
+    """文件列表内的滚轮事件不冒泡到外层页面。"""
+
+    def wheelEvent(self, event):
+        super().wheelEvent(event)
+        event.accept()
+
+
 class UnpackPage(QWidget):
 
     def __init__(self, win):
@@ -2055,7 +2063,7 @@ class UnpackPage(QWidget):
         self.e_search.textChanged.connect(self._on_search)
 
         # 文件表
-        self.tbl = AutoFitTable(0, 7)
+        self.tbl = FileListTable(0, 7)
         self.tbl.setHorizontalHeaderLabels(
             ["路径", "类型", "权限", "uid", "gid", "大小", "状态"])
         # 列宽：首次铺满（路径占大头），之后每列都能手动拖
@@ -2336,7 +2344,7 @@ class UnpackPage(QWidget):
         def find():
             for r in range(self.tbl.rowCount()):
                 it = self.tbl.item(r, 0)
-                if it is not None and it.text() == rel:
+                if it is not None and it.data(Qt.UserRole) == rel:
                     return r
             return -1
         row = find()
@@ -2362,11 +2370,13 @@ class UnpackPage(QWidget):
         for i, rel in enumerate(rows):
             e = self.entries[rel]
             mode = e.get("mode", 0)
-            vals = [rel, fmt_type(mode), fmt_mode(mode), str(e.get("uid", 0)),
+            vals = [rel or "/", fmt_type(mode), fmt_mode(mode), str(e.get("uid", 0)),
                     str(e.get("gid", 0)), self._size(rel),
                     "新增" if e.get("_new") else ""]
             for c, t in enumerate(vals):
                 it = QTableWidgetItem(t)
+                if c == 0:
+                    it.setData(Qt.UserRole, rel)
                 if c:
                     it.setTextAlignment(Qt.AlignCenter)
                 if c == 2:
@@ -2421,9 +2431,11 @@ class UnpackPage(QWidget):
         self.tbl_chg.blockSignals(True)
         self.tbl_chg.setRowCount(len(ch))
         for i, (rel, kind, mode, detail) in enumerate(ch):
-            vals = [rel, kind, fmt_type(mode), detail]
+            vals = [rel or "/", kind, fmt_type(mode), detail]
             for c, t in enumerate(vals):
                 it = QTableWidgetItem(t)
+                if c == 0:
+                    it.setData(Qt.UserRole, rel)
                 if c in (1, 2):
                     it.setTextAlignment(Qt.AlignCenter)
                 it.setForeground(QColor(self.CHG_COLOR.get(kind, "#666666")))
@@ -2451,7 +2463,7 @@ class UnpackPage(QWidget):
     def _jump_to_main(self, idx):
         """双击变更行 → 跳转定位到上方完整列表中的同一路径。"""
         try:
-            rel = self.tbl_chg.item(idx.row(), 0).text()
+            rel = self.tbl_chg.item(idx.row(), 0).data(Qt.UserRole)
         except Exception:
             return
         if rel not in self.entries:
@@ -2476,7 +2488,7 @@ class UnpackPage(QWidget):
         if not self.dir:
             return
         col, row = item.column(), item.row()
-        rel = self.tbl.item(row, 0).text()
+        rel = self._row_rel(row)
         e = self.entries.get(rel)
         if e is None:
             return
@@ -2506,6 +2518,10 @@ class UnpackPage(QWidget):
         self.save()
         self.fill_changes()
 
+    def _row_rel(self, row):
+        item = self.tbl.item(row, 0)
+        return item.data(Qt.UserRole) if item is not None else None
+
     def selected(self):
         return sorted(set(i.row() for i in self.tbl.selectedIndexes()))
 
@@ -2516,7 +2532,7 @@ class UnpackPage(QWidget):
             return
         n = 0
         for r in rows:
-            rel = self.tbl.item(r, 0).text()
+            rel = self._row_rel(r)
             e = self.entries.get(rel)
             if e is not None:
                 e["mode"] = stat.S_IFMT(e.get("mode", 0)) | perm
@@ -2528,7 +2544,7 @@ class UnpackPage(QWidget):
     def restore(self):
         # 未选中 = 全部条目（不受搜索过滤影响）；选中时只处理可见的选中行
         sels = self.selected()
-        rels = ([self.tbl.item(r, 0).text() for r in sels]
+        rels = ([self._row_rel(r) for r in sels]
                 if sels else list(self.entries))
         n = 0
         for rel in rels:
@@ -2572,24 +2588,31 @@ class UnpackPage(QWidget):
         menu.exec_(self.tbl.viewport().mapToGlobal(pos))
 
     def _double_click(self, idx):
-        """双击任意单元格 = 修改权限 / 属主（弹窗，多选批量应用）。
-
-        原来双击「路径」可以改路径字符串，但改完并不生效（无用功能），
-        已改为弹「编辑权限 / 属主」对话框。
-        """
-        if idx.isValid() and idx.row() not in self.selected():
-            self.tbl.selectRow(idx.row())
-        self.edit_perm()
+        """普通文件打开内置编辑器；目录和链接保留权限编辑入口。"""
+        if not idx.isValid():
+            return
+        rel = self._row_rel(idx.row())
+        entry = self.entries.get(rel)
+        if entry is None:
+            return
+        if stat.S_ISREG(entry.get("mode", 0)):
+            self._edit_content_for(rel)
+        else:
+            if idx.row() not in self.selected():
+                self.tbl.selectRow(idx.row())
+            self.edit_perm()
 
     def edit_content(self):
-        """编辑选中文件的内容（文本，≤1MB；二进制走「用系统程序打开」）。"""
+        """编辑右键菜单所选文件。"""
+        rows = self.selected()
+        if rows:
+            self._edit_content_for(self._row_rel(rows[0]))
+
+    def _edit_content_for(self, rel):
+        """编辑指定普通文本文件；二进制仍使用外部程序打开。"""
         if not self.dir:
             QMessageBox.warning(self, "提示", "请先解包或载入一个目录")
             return
-        rows = self.selected()
-        if not rows:
-            return
-        rel = self.tbl.item(rows[0], 0).text()
         e = self.entries.get(rel)
         if e is None:
             return
@@ -2645,7 +2668,7 @@ class UnpackPage(QWidget):
         rows = self.selected()
         if not rows:
             return
-        rel = self.tbl.item(rows[0], 0).text()
+        rel = self._row_rel(rows[0])
         p = self._abs_of_rel(rel)
         if not os.path.exists(p):
             QMessageBox.warning(self, "提示", "磁盘上找不到该文件：\n%s" % p)
@@ -2658,14 +2681,14 @@ class UnpackPage(QWidget):
         rows = self.selected()
         if not rows:
             return
-        rel0 = self.tbl.item(rows[0], 0).text()
+        rel0 = self._row_rel(rows[0])
         dlg = EditPermDialog(self, rel0, self.entries.get(rel0, {}))
         if dlg.exec_() != QDialog.Accepted:
             return
         perm, uid, gid = dlg.result_info()
         n = 0
         for r in rows:
-            rel = self.tbl.item(r, 0).text()
+            rel = self._row_rel(r)
             e = self.entries.get(rel)
             if e is None:
                 continue
@@ -2722,11 +2745,11 @@ class UnpackPage(QWidget):
         rows = self.selected()
         if not rows:
             return
-        names = [self.tbl.item(r, 0).text() for r in rows]
+        names = [self._row_rel(r) for r in rows]
         if QMessageBox.question(
                 self, "确认删除",
                 "将从磁盘和清单里删除以下 %d 个条目：\n\n%s\n\n继续？"
-                % (len(names), "\n".join(names[:20]) +
+                % (len(names), "\n".join(rel or "/" for rel in names[:20]) +
                    ("\n..." if len(names) > 20 else ""))) != QMessageBox.Yes:
             return
         removed = 0
@@ -3777,6 +3800,87 @@ class SupportDialog(QDialog):
         self._refresh_qr()
 
 
+def read_device_firmware(adb, destination, verify_layout, emit, run=None):
+    """通过已授权的 ADB 连接只读导出 MTD；所有检查通过后才发布文件。"""
+    import subprocess
+    import tempfile
+    run = run or subprocess.run
+    destination = os.path.abspath(destination)
+    parent = os.path.dirname(destination)
+    if os.path.lexists(destination):
+        raise ValueError("目标已存在，请指定新文件")
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+    def call(args, timeout=20):
+        try:
+            result = run([adb] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         timeout=timeout, creationflags=flags)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("ADB 操作超时：" + args[0])
+        if result.returncode:
+            detail = (result.stderr or result.stdout).decode("utf-8", "replace").strip()
+            raise RuntimeError("ADB 操作失败：" + detail)
+        return result.stdout.decode("utf-8", "replace")
+
+    devices = []
+    for line in call(["devices"]).splitlines():
+        if "\t" in line:
+            serial, state = line.strip().split("\t", 1)
+            devices.append((serial, state.split()[0] if state.split() else ""))
+    available = [serial for serial, state in devices if state == "device"]
+    if len(available) != 1 or len(devices) != 1:
+        raise ValueError("请只连接一台设备，并在设备端完成 ADB 授权（正常状态：device）")
+    prefix = ["-s", available[0]]
+    parts = []
+    for line in call(prefix + ["shell", "cat", "/proc/mtd"]).splitlines():
+        match = re.fullmatch(r'mtd(\d+):\s+([0-9a-fA-F]+)\s+[0-9a-fA-F]+\s+"([^"]+)"', line.strip())
+        if match:
+            parts.append((int(match[1]), int(match[2], 16), match[3]))
+        elif line.strip().startswith("mtd"):
+            raise ValueError("无法完整解析 /proc/mtd 分区表")
+    parts.sort()
+    if not parts or any(size <= 0 for _, size, _ in parts) or len({i for i, _, _ in parts}) != len(parts):
+        raise ValueError("设备没有有效且唯一的 MTD 分区")
+    total = sum(size for _, size, _ in parts)
+    if shutil.disk_usage(parent).free < total + max(size for _, size, _ in parts):
+        raise ValueError("保存目录剩余空间不足")
+    emit("[+] 发现 %d 个 MTD 分区，共 %d 字节" % (len(parts), total))
+    layout = []
+    with tempfile.TemporaryDirectory(prefix=".zxw-adb-", dir=parent) as tmp:
+        merged = os.path.join(tmp, "full.bin")
+        partition = os.path.join(tmp, "partition.bin")
+        with open(merged, "wb") as output:
+            for index, size, name in parts:
+                emit("[*] 正在读取 mtd%d (%s)，%d 字节" % (index, name, size))
+                call(prefix + ["pull", "/dev/mtdblock%d" % index, partition], timeout=180)
+                if not os.path.isfile(partition) or os.path.getsize(partition) != size:
+                    raise ValueError("mtd%d 导出大小与分区表不一致" % index)
+                layout.append((output.tell(), size))
+                with open(partition, "rb") as src:
+                    shutil.copyfileobj(src, output, 1024 * 1024)
+                os.unlink(partition)
+            output.flush()
+            os.fsync(output.fileno())
+        if os.path.getsize(merged) != total:
+            raise ValueError("合并后的固件大小与分区总大小不一致")
+        verify_layout(merged, layout)
+        if os.name == "nt":
+            os.rename(merged, destination)
+        else:
+            os.link(merged, destination)
+    return destination
+
+
+def verify_device_firmware_layout(path, expected_layout):
+    raw, parts, _ = P.load_firmware(path, emit=lambda _: None)
+    actual = [(part.offset, part.size) for part in parts]
+    if len(parts) < 2 or actual != expected_layout:
+        raise ValueError("镜像分区偏移或大小与 MTD 导出布局不一致，未生成整机固件")
+    ok = P.check_header_checksum(raw)[0]
+    if ok is False:
+        raise ValueError("固件分区表校验不通过，未生成整机固件")
+
+
 class MainWindow(QWidget):
     def closeEvent(self, event):
         if self._support_dialog is not None:
@@ -3840,7 +3944,10 @@ class MainWindow(QWidget):
         self.e_fw.setPlaceholderText("选择中兴微编程器固件（*.bin）")
         r1.addWidget(self.e_fw, 1)
         r1.addWidget(_btn('选择整机固件', self.pick_firmware, accent=True))
-        r1.addWidget(_btn("重新解析", self.reparse))
+        self.e_fw.returnPressed.connect(self.reparse)
+        self.btn_extract_device = _btn("提取设备固件", self.extract_device_firmware)
+        self.btn_extract_device.setToolTip("通过已授权的 ADB 连接只读导出固件；路径框回车可重新载入")
+        r1.addWidget(self.btn_extract_device)
         tv.addLayout(r1)
 
         r2 = FlowLayout()
@@ -4099,6 +4206,45 @@ class MainWindow(QWidget):
         settings.sync()
         self.e_fw.setText(path)
         self.load_firmware(path)
+
+    def extract_device_firmware(self):
+        settings = QSettings('ZXW', 'FirmwareToolbox')
+        saved_adb = settings.value('extract/adb_path', '', type=str)
+        exe_name = 'adb.exe' if os.name == 'nt' else 'adb'
+        base = os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, 'frozen', False) else BASE_DIR
+        local_adb = os.path.join(base, exe_name)
+        adb = (saved_adb if os.path.isfile(saved_adb) else
+               local_adb if os.path.isfile(local_adb) else shutil.which(exe_name))
+        if not adb:
+            rule = "ADB (adb.exe);;所有文件 (*)" if os.name == 'nt' else "所有文件 (*)"
+            adb, _ = QFileDialog.getOpenFileName(self, "选择 ADB 程序", base, rule)
+            if not adb:
+                return
+        directory = settings.value('extract/last_directory', '', type=str)
+        if not os.path.isdir(directory):
+            current = self.e_fw.text().strip()
+            directory = (current if os.path.isdir(current) else os.path.dirname(current)) or os.path.expanduser('~')
+        output, _ = QFileDialog.getSaveFileName(
+            self, "保存从设备提取的整机固件", os.path.join(directory, "full.bin"), "固件 (*.bin)")
+        if not output:
+            return
+        if not output.lower().endswith('.bin'):
+            output += '.bin'
+        output = os.path.abspath(output)
+        if os.path.lexists(output):
+            QMessageBox.warning(self, "文件已存在", "提取不会覆盖已有文件，请另选文件名。")
+            return
+        settings.setValue('extract/adb_path', adb)
+        settings.setValue('extract/last_directory', os.path.dirname(output))
+
+        def done(rc, msg):
+            if rc == 0:
+                self.load_firmware(output)
+            else:
+                QMessageBox.warning(self, "提取设备固件失败", msg)
+
+        self.run_job(lambda emit: read_device_firmware(adb, output, verify_device_firmware_layout, emit),
+                     "提取设备固件", done)
 
     def reparse(self):
         path = self.e_fw.text().strip()
